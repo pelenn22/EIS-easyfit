@@ -631,6 +631,69 @@ presetSelect.addEventListener('change', () => {
   }
 });
 
+const exampleSelect = document.getElementById('exampleSelect');
+
+// Populate the dropdown with .txt files from the GitHub folder
+async function populateExampleFiles() {
+  const apiUrl = 'https://api.github.com/repos/pelenn22/EIS-easyfit/contents/Example%20data';
+  try {
+    const resp = await fetch(apiUrl);
+    if (!resp.ok) throw new Error('GitHub API request failed');
+    const items = await resp.json();
+    // Clear any existing options except the placeholder (first child)
+    while (exampleSelect.options.length > 1) {
+      exampleSelect.remove(1);
+    }
+    items.forEach(item => {
+      if (item.type === 'file' && item.name.endsWith('.txt')) {
+        const opt = document.createElement('option');
+        opt.value = item.name;
+        // Show a readable name (remove extension)
+        opt.textContent = item.name.replace('.txt', '').replace(/_/g, ' ');
+        exampleSelect.appendChild(opt);
+      }
+    });
+  } catch (e) {
+    console.error('Failed to fetch example list:', e);
+  }
+}
+populateExampleFiles();
+
+// Load example data immediately when a selection is made
+exampleSelect.addEventListener('change', async () => {
+  const fileName = exampleSelect.value;
+  if (!fileName) return;
+
+  const rawUrl = `https://raw.githubusercontent.com/pelenn22/EIS-easyfit/main/Example%20data/${fileName}`;
+  try {
+    const resp = await fetch(rawUrl);
+    if (!resp.ok) throw new Error(`Cannot fetch ${fileName}: ${resp.status}`);
+
+    const csvText = await resp.text();
+    const data = parseImpedanceData(csvText);
+    if (data.freq.length < 2) {
+      alert('No data rows found in the example file.');
+      return;
+    }
+
+    // Same initialization as file input
+    loadedData = data;
+    lastFit = null;
+    freqRange = null;
+    downloadBtn.disabled = true;
+    document.getElementById('fitResults').innerHTML = '';
+
+    minFreqInput.value = formatFreq(Math.min.apply(null, data.freq));
+    maxFreqInput.value = formatFreq(Math.max.apply(null, data.freq));
+    rangeInfo.textContent = '';
+    rangePanel.style.display = 'flex';
+    renderPlots(data, null);
+    fitBtn.disabled = false;
+  } catch (err) {
+    alert('Failed to load example data: ' + err.message);
+  }
+});
+
   const circuitDiagram = document.getElementById('circuitDiagram');
   const circuitError = document.getElementById('circuitError');
 

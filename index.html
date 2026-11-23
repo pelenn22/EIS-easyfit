@@ -12,18 +12,20 @@
 <h1>Impedance Spectrum Fitter</h1>
 
 <div class="controls">
+  <label for="exampleSelect" style="margin-left:8px;">Example data:</label>
+  <select id="exampleSelect" style="margin-left:4px;">
+    <option value="">--Select--</option>
+    <!-- options will be populated dynamically -->
+  </select>
   <label>
     Load data (CSV / txt):
     <input type="file" id="fileInput" accept=".csv,.txt" />
+
   </label>
 
-  <button id="fitBtn" disabled>Fit</button>
-  <button id="downloadBtn" disabled>Download Parameters</button>
-  <label for="exportFormatSelect" style="margin-left:8px;">Export format:</label>
-  <select id="exportFormatSelect" style="margin-left:4px;">
-    <option value="tsv">TSV (tab‑separated)</option>
-    <option value="csv">CSV (semicolon‑separated)</option>
-  </select>
+
+
+
 </div>
 
 <!-- Frequency range controls (hidden until data loaded) -->
@@ -61,6 +63,7 @@
     <option value="R-(R)(P)-(R)(P)">R-(R)(P)-(R)(P)</option>
   </select>
   <div id="circuitDiagram" class="circuit-diagram" style="border:1px solid #dde1e6; padding:8px; background:#fff;"></div>
+  <button id="fitBtn" disabled>Fit</button>
 </section>
 
 <div class="plots">
@@ -70,6 +73,13 @@
 </div>
 
 <div id="fitResults"></div>
+
+<button id="downloadBtn" disabled>Download Parameters</button>
+<label for="exportFormatSelect" style="margin-left:8px;">Export format:</label>
+<select id="exportFormatSelect" style="margin-left:4px;">
+  <option value="tsv">TSV (tab‑separated)</option>
+  <option value="csv">CSV (semicolon‑separated)</option>
+</select>
 
 <script src="script.js"></script>
 </body>
