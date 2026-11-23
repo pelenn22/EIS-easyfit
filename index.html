@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>EIS Fitter</title>
+<link rel="stylesheet" href="style.css" />
+<!-- Plotly for plotting (the Levenberg-Marquardt solver is built into script.js) -->
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.24.2/plotly.min.js"></script>
+</head>
+<body>
+<h1>Impedance Spectrum Fitter</h1>
+
+<div class="controls">
+  <label>
+    Load data (CSV / txt):
+    <input type="file" id="fileInput" accept=".csv,.txt" />
+  </label>
+
+  <button id="fitBtn" disabled>Fit</button>
+  <button id="downloadBtn" disabled>Download Parameters</button>
+  <label for="exportFormatSelect" style="margin-left:8px;">Export format:</label>
+  <select id="exportFormatSelect" style="margin-left:4px;">
+    <option value="tsv">TSV (tab‑separated)</option>
+    <option value="csv">CSV (semicolon‑separated)</option>
+  </select>
+</div>
+
+<!-- Frequency range controls (hidden until data loaded) -->
+<div class="range-controls" id="rangePanel" style="display:none; margin-top:12px; gap:8px; align-items:center;">
+  <label>Fit frequency range (Hz):
+    Min <input type="text" id="minFreqInput" size="8" placeholder="e.g. 0.01" />
+    <button id="minDiv10" class="mini-btn" title="Divide min by 10">÷10</button>
+    <button id="minMul10" class="mini-btn" title="Multiply min by 10">×10</button>
+    <button id="decLowerBtn" class="mini-btn" title="Decrease lower boundary (exclude one lowest point)">↘</button>
+    Max <input type="text" id="maxFreqInput" size="8" placeholder="e.g. 1000" />
+    <button id="maxDiv10" class="mini-btn" title="Divide max by 10">÷10</button>
+    <button id="maxMul10" class="mini-btn" title="Multiply max by 10">×10</button>
+    <button id="decUpperBtn" class="mini-btn" title="Decrease upper boundary (exclude one highest point)">↘</button>
+    <button id="applyRangeBtn">Apply</button>
+    <button id="resetRangeBtn" class="ghost-btn">Reset</button>
+  </label>
+  <span id="rangeInfo" class="range-info"></span>
+</div>
+
+<!-- Equivalent circuit generator -->
+<section id="circuitPanel" class="circuit-panel" style="margin-top:16px;">
+  <div class="circuit-input-row" style="margin-bottom:8px;">
+    <label for="circuitInput">Equivalent circuit:</label>
+    <input type="text" id="circuitInput" placeholder="e.g. R-(R)(C)" value="R-(R)(C)" size="30" />
+    <span id="circuitError" class="circuit-error" style="color:#c00; margin-left:8px;"></span>
+  </div>
+  <div class="circuit-rules" style="font-size:0.85rem; color:#555; margin-bottom:8px;">
+    <b>Rules:</b> Elements: <b>R</b>=Resistor, <b>C</b>=Capacitor, <b>I</b>=Inductor, <b>P</b>=CPE, <b>W</b>=Warburg. Series: <b>-</b> (or <b>+</b>). Parallel: adjacent elements, e.g. <b>(R)(C)</b>. Grouping: <b>( )</b>. Example: <b>R-(R)(C)</b> = R in series with (R parallel C).
+  </div>
+  <label for="presetSelect" style="margin-right:4px;">Presets:</label>
+  <select id="presetSelect" style="margin-bottom:8px;">
+    <option value="">--Select--</option>
+    <option value="R-(R)(P)-(R-W)(P)">R-(R)(P)-(R-W)(P)</option>
+    <option value="R-(R)(P)">R-(R)(P)</option>
+    <option value="R-(R)(P)-(R)(P)">R-(R)(P)-(R)(P)</option>
+  </select>
+  <div id="circuitDiagram" class="circuit-diagram" style="border:1px solid #dde1e6; padding:8px; background:#fff;"></div>
+</section>
+
+<div class="plots">
+  <div id="nyquist" class="plot"></div>
+  <div id="bodeMag" class="plot"></div>
+  <div id="bodePhase" class="plot"></div>
+</div>
+
+<div id="fitResults"></div>
+
+<script src="script.js"></script>
+</body>
+</html>
