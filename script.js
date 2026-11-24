@@ -31,21 +31,128 @@
   // ---------- Parsing (data file) ----------
 
   function parseImpedanceData(text) {
-    const lines = text.split(/\r?\n/);
+  // Improved: skip leading non-data lines (metadata, comments) until we find a header or a plausible data row
+    // --- Intelligent CSV/TSV/TXT parser with fallback -------------------
+    // 1. Split into non‑empty lines
+    const rawLines = text.split(/\r?\n/).filter(l => l.trim().length);
+    if (rawLines.length === 0) return {freq: [], zreal: [], minusImZ: []};
+
+    // 2. Guess delimiter: test comma, semicolon, tab and whitespace.
+    const delimiters = [/[,\t]+/, /\s+/]; // order matters – prefer explicit separators
+    let bestDelim = delimiters[1];
+    let bestScore = 0;
+    for (const delim of delimiters) {
+      const score = rawLines.reduce((c,l) => c + (l.trim().split(delim).length >= 3 ? 1 : 0), 0);
+      if (score > bestScore) { bestScore = score; bestDelim = delim; }
+    }
+
+    // 3. Detect header row (anywhere) or find first plausible data line
+    let headerLineIdx = rawLines.findIndex(line => {
+      const toks = line.trim().split(bestDelim);
+      // Require a token that matches a known column keyword **and** contains a '/' (typical for the headers)
+      return toks.some(tok => /^(freq|hz|frequency|re|real|zre|im|imag)[\\/_]/i.test(tok));
+    });
+
+
+    let startIdx = 0;
+    const colIdx = {freq: -1, re: -1, im: -1};
+    if (headerLineIdx !== -1) {
+      const headerTokens = rawLines[headerLineIdx].trim().split(bestDelim);
+      headerTokens.forEach((tok, i) => {
+        const t = tok.toLowerCase();
+        if (colIdx.freq === -1 && /(freq|hz|frequency)/i.test(t)) colIdx.freq = i;
+        if (colIdx.re === -1 && /^(re\(|real|zre|impedance_r|_r)/i.test(t)) colIdx.re = i;
+        if (colIdx.im === -1 && /(?:_i[\\/]|im\(|-?im\b)/i.test(t)) colIdx.im = i;
+      });
+
+
+      startIdx = headerLineIdx + 1; // data starts after header
+    } else {
+      // Infer column order when no explicit header is present
+      const sampleLines = rawLines.filter(l => {
+        const toks = l.trim().split(bestDelim);
+        return toks.length >= 3 && toks.every(tok => !isNaN(Number(tok.replace(',', '.'))));
+      }).slice(0, 5);
+      if (sampleLines.length > 0) {
+        const colCount = sampleLines[0].trim().split(bestDelim).length;
+        const stats = Array.from({length: colCount}, () => ({freqScore: 0, realScore: 0, imagNegScore: 0, imagPosScore: 0}));
+        for (const line of sampleLines) {
+          const toks = line.trim().split(bestDelim);
+          for (let i = 0; i < colCount; i++) {
+            const val = Number(toks[i].replace(',', '.'));
+            if (isNaN(val)) continue;
+            // Frequency plausibility
+            if (val >= 1e-3 && val <= 1e7) stats[i].freqScore++;
+            // Real part plausibility
+            if (val > 0) stats[i].realScore++;
+            // Imag part: prefer negative (original Im) values
+            if (val < 0) stats[i].imagNegScore++; else if (val >= 0) stats[i].imagPosScore++;
+          }
+        }
+        // Choose column with highest freqScore as frequency
+        let freqIdx = 0;
+        for (let i = 1; i < colCount; i++) {
+          if (stats[i].freqScore > stats[freqIdx].freqScore) freqIdx = i;
+        }
+        // Among remaining, choose highest realScore as real
+        const remaining = [];
+        for (let i = 0; i < colCount; i++) if (i !== freqIdx) remaining.push(i);
+        let realIdx = remaining[0];
+        for (let i = 1; i < remaining.length; i++) {
+          if (stats[remaining[i]].realScore > stats[realIdx].realScore) realIdx = remaining[i];
+        }
+        // Choose imag column: prefer negative values
+        let imagIdx = remaining.find(i => i !== realIdx && stats[i].imagNegScore > 0);
+        if (imagIdx === undefined) {
+          imagIdx = remaining.find(i => i !== realIdx);
+        }
+        colIdx.freq = freqIdx;
+        colIdx.re = realIdx;
+        colIdx.im = imagIdx;
+      }
+    }
+
     const freq = [], zreal = [], minusImZ = [];
-    for (const line of lines) {
-      const tokens = line.trim().split(/[\s,;]+/);
+    const toNumber = (s) => {
+      const clean = s.replace(',', '.');
+      const n = Number(clean);
+      return isFinite(n) ? n : null;
+    };
+
+    for (let i = startIdx; i < rawLines.length; i++) {
+      const tokens = rawLines[i].trim().split(bestDelim);
       if (tokens.length < 3) continue;
-      const f = Number(tokens[0]);
-      const zr = Number(tokens[1]);
-      const mi = Number(tokens[2]);
-      if (!isFinite(f) || !isFinite(zr) || !isFinite(mi) || f <= 0) continue;
+      const f = toNumber(tokens[colIdx.freq]);
+      const zr = toNumber(tokens[colIdx.re]);
+      const imRaw = toNumber(tokens[colIdx.im]);
+      if (f === null || zr === null || imRaw === null) continue;
+      // Basic sanity checks
+      if (f < 1e-3 || f > 1e7) continue;
+      if (zr <= 0) continue;
+      const im = imRaw < 0 ? -imRaw : imRaw; // ensure positive -Im
       freq.push(f);
       zreal.push(zr);
-      minusImZ.push(mi);
+      minusImZ.push(im);
+    }
+
+    // Fallback: simple split if we got too few rows after intelligent parsing
+    if (freq.length < 2) {
+      const lines = text.split(/\r?\n/);
+      for (const line of lines) {
+        const toks = line.trim().split(/[\s,;]+/);
+        if (toks.length < 3) continue;
+        const f = toNumber(toks[0]), zr = toNumber(toks[1]), imRaw = toNumber(toks[2]);
+        if (f === null || zr === null || imRaw === null) continue;
+        if (f < 1e-3 || f > 1e7) continue;
+        if (zr <= 0) continue;
+        const im = imRaw < 0 ? -imRaw : imRaw;
+        freq.push(f); zreal.push(zr); minusImZ.push(im);
+      }
     }
     return {freq, zreal, minusImZ};
   }
+  // expose for testing/debugging
+  if (typeof window !== 'undefined') window.parseImpedanceData = parseImpedanceData;
 
   // ---------- Circuit models ----------
 
@@ -72,6 +179,8 @@
       }
       return {real: re, imag: im};
     });
+
+
   }
 
   // ---------- Custom circuits ----------
@@ -142,7 +251,11 @@
         ELEMENT_PARAMS[k].forEach((spec) => {
           const name = spec[0] + counters[k];
           params.push({name, unit: spec[1], guess: spec[2]});
+
+
         });
+
+
       } else if (n.type === 'series') {
         n.children.forEach(walk);
       } else if (n.type === 'parallel') {
@@ -197,6 +310,8 @@
       if (p.name[0] === 'R') return Math.max(maxRe / (rCount || 1), 1);
       return p.guess;
     });
+
+
   }
 
   // ---------- Levenberg-Marquardt (built-in) ----------
@@ -230,6 +345,8 @@
       maxIterations: 100,
       errorTolerance: 1e-3
     }, options || {});
+
+
     const n = initialValues.length;
     let p = initialValues.slice();
     let r = residualFunc(p);
@@ -314,6 +431,8 @@
       maxIterations: 100,
       errorTolerance: 1e-3
     });
+
+
     return {values: result.parameterValues, error: result.parameterError, iterations: result.iterations, success: result.success, stopReason: result.stopReason};
   }
 
@@ -427,6 +546,8 @@
         drawNode(c, cx, y, out);
         cx += measure(c).w;
       });
+
+
       return;
     }
     // parallel
@@ -456,8 +577,8 @@
     // terminals
     const leftX = PAD_X;
     const rightX = PAD_X + m.w;
-    dot(leftX, y0, out); out.push('<text x="' + leftX + '" y="' + (y0-8) + '" class="clabel" text-anchor="middle">a</text>');
-    dot(rightX, y0, out); out.push('<text x="' + rightX + '" y="' + (y0-8) + '" class="clabel" text-anchor="middle">b</text>');
+    dot(leftX, y0, out);
+    dot(rightX, y0, out);
     out.push('</svg>');
     return out.join('');
   }
@@ -502,7 +623,13 @@
       mode: 'markers', type: 'scatter', name,
       marker: {size, color}
     });
+
+
     const nyqTraces = [pts(ix, DATA_COLOR, 'Data', 6)];
+      if (showKK) {
+        const kkBad = computeKKBad(data);
+        if (kkBad.length) nyqTraces.push(pts(kkBad, '#ff0000', 'KK violation', 8));
+      }
     if (ex.length) nyqTraces.push(pts(ex, EXCLUDED_COLOR, 'Data (excluded)', 6));
     if (fitTrace) nyqTraces.push(fitTrace);
     Plotly.react('nyquist', nyqTraces, {
@@ -514,6 +641,8 @@
       plot_bgcolor: '#fff'
     });
 
+
+
     // Bode magnitude
     const mag = zreal.map((r,i) => Math.sqrt(r*r + zimag[i]*zimag[i]));
     const magPts = (list, color, name) => ({
@@ -522,6 +651,8 @@
       mode: 'markers', type: 'scatter', name,
       marker: {size: 4, color}
     });
+
+
     const magTraces = [magPts(ix, DATA_COLOR, 'Data')];
     if (ex.length) magTraces.push(magPts(ex, EXCLUDED_COLOR, 'Data (excluded)'));
     if (fitMag) magTraces.push(fitMag);
@@ -534,6 +665,8 @@
       plot_bgcolor: '#fff'
     });
 
+
+
     // Bode phase
     const phase = zreal.map((r,i) => Math.atan2(zimag[i], r) * 180 / Math.PI);
     const phasePts = (list, color, name) => ({
@@ -542,6 +675,8 @@
       mode: 'markers', type: 'scatter', name,
       marker: {size: 4, color}
     });
+
+
     const phaseTraces = [phasePts(ix, DATA_COLOR, 'Data')];
     if (ex.length) phaseTraces.push(phasePts(ex, EXCLUDED_COLOR, 'Data (excluded)'));
     if (fitPhase) phaseTraces.push(fitPhase);
@@ -553,9 +688,24 @@
       hovermode: 'closest',
       plot_bgcolor: '#fff'
     });
+
+
   }
 
-  // ---------- Results ----------
+  // ---------- Kramer‑Kronig Test ----------
+let showKK = false;
+function computeKKBad(data) {
+  const {zreal, minusImZ} = data;
+  const ratios = zreal.map((r,i) => r / minusImZ[i]);
+  const sorted = ratios.slice().sort((a,b)=>a-b);
+  const median = sorted[Math.floor(sorted.length/2)];
+  const bad = [];
+  ratios.forEach((v,i)=>{ const rel = v/median; if (rel > 5 || rel < 0.2) bad.push(i); });
+
+
+  return bad;
+}
+// ---------- Results ----------
 
   function renderFitTable(names, values, meta, error, absErrors = []) {
     const div = document.getElementById('fitResults');
@@ -571,6 +721,8 @@
       const relErr = (absErrors[i] !== undefined && values[i] !== 0 && !isNaN(absErrors[i])) ? (absErrors[i]/Math.abs(values[i])*100).toFixed(2) : '—';
       html += '<tr><td>' + n + '</td><td><span class="fit-quality ' + qualityClass + '">' + val + '</span></td><td>' + absErr + '</td><td>' + relErr + '</td></tr>';
     });
+
+
     // Add fit quality row (spanning three columns for value+errors)
     html += '<tr><td>Fit quality</td><td colspan="3"><span class="fit-quality ' + qualityClass + '">' + qualityLabel + '</span></td></tr>';
     html += '</table>';
@@ -581,6 +733,8 @@
   function downloadCSV(rows) {
     const csvContent = rows.map(r => r.join(',')).join('\n');
     const blob = new Blob([csvContent], {type: 'text/csv;charset=utf-8'});
+
+
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -609,6 +763,12 @@
 
   const fitBtn = document.getElementById('fitBtn');
   const downloadBtn = document.getElementById('downloadBtn');
+const kkBtn = document.getElementById('kkBtn');
+
+
+
+
+
   const exportFormatSelect = document.getElementById('exportFormatSelect');
   const rangePanel = document.getElementById('rangePanel');
   const minFreqInput = document.getElementById('minFreqInput');
@@ -621,6 +781,7 @@
   circuitInput.value = '';
   const presetSelect = document.getElementById('presetSelect');
 presetSelect.addEventListener('change', () => {
+
   const val = presetSelect.value;
   if (val) {
     circuitInput.value = val;
@@ -630,6 +791,14 @@ presetSelect.addEventListener('change', () => {
     updateCircuitDiagram();
   }
 });
+
+// Toggle Kramer‑Kronig test overlay (single registration)
+kkBtn.addEventListener('click', () => {
+  showKK = !showKK;
+  kkBtn.textContent = showKK ? 'Hide K‑K Test' : 'Kramers‑Kronig Test';
+  renderPlots(loadedData, lastFit);
+});
+
 
 const exampleSelect = document.getElementById('exampleSelect');
 
@@ -653,6 +822,8 @@ async function populateExampleFiles() {
         exampleSelect.appendChild(opt);
       }
     });
+
+
   } catch (e) {
     console.error('Failed to fetch example list:', e);
   }
@@ -688,11 +859,13 @@ exampleSelect.addEventListener('change', async () => {
     rangeInfo.textContent = '';
     rangePanel.style.display = 'flex';
     renderPlots(data, null);
-    fitBtn.disabled = false;
+    fitBtn.disabled = false; kkBtn.disabled = false;
   } catch (err) {
     alert('Failed to load example data: ' + err.message);
   }
 });
+
+
 
   const circuitDiagram = document.getElementById('circuitDiagram');
   const circuitError = document.getElementById('circuitError');
@@ -704,6 +877,7 @@ exampleSelect.addEventListener('change', async () => {
     const reader = new FileReader();
     reader.onload = (ev) => {
       const data = parseImpedanceData(ev.target.result);
+        console.log('Parsed', data.freq.length, 'points');
       if (data.freq.length < 2) {
         alert('No data rows found. Expected columns: freq (Hz), Re(Z) (Ohm), -Im(Z) (Ohm).');
         return;
@@ -719,10 +893,12 @@ exampleSelect.addEventListener('change', async () => {
       rangeInfo.textContent = '';
       rangePanel.style.display = 'flex';
       renderPlots(data, null);
-      fitBtn.disabled = false;
+      fitBtn.disabled = false; kkBtn.disabled = false;
     };
     reader.readAsText(file);
   });
+
+
 
   fitBtn.addEventListener('click', () => {
     if (!loadedData) return;
@@ -782,6 +958,8 @@ exampleSelect.addEventListener('change', async () => {
             const row = new Array(n).fill(0);
             row[i] = 1; return row;
           });
+
+
           for (let i = 0; i < n; i++) {
             // pivot
             let maxRow = i;
@@ -828,6 +1006,8 @@ exampleSelect.addEventListener('change', async () => {
     }
   });
 
+
+
   downloadBtn.addEventListener('click', () => {
     if (!lastFit || !loadedData) return;
     // --- Parameters section (tab‑separated) ---
@@ -840,6 +1020,8 @@ exampleSelect.addEventListener('change', async () => {
       const relErr = (absErr !== '' && val !== 0 && !isNaN(absErr)) ? (absErr / Math.abs(val) * 100).toFixed(2) : '';
       allRows.push([n, val, absErr, relErr]);
     });
+
+
     allRows.push([]); // blank line
 
     // --- Raw data section ---
@@ -864,6 +1046,8 @@ exampleSelect.addEventListener('change', async () => {
       allRows.push([z.freq, z.real, -z.imag]);
     });
 
+
+
     // Build file content according to selected format (TSV or CSV)
     const fmt = exportFormatSelect.value; // 'tsv' or 'csv'
     const delim = fmt === 'csv' ? ';' : '\t';
@@ -872,6 +1056,8 @@ exampleSelect.addEventListener('change', async () => {
     const bom = '\uFEFF'; // ensure UTF‑8 detection in Excel
     const fileContent = bom + allRows.map(r => r.join(delim)).join('\n');
     const blob = new Blob([fileContent], {type: mime});
+
+
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -881,6 +1067,8 @@ exampleSelect.addEventListener('change', async () => {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   });
+
+
 
   // Frequency range UI helpers
   function parseFreqInput(str) {
@@ -936,7 +1124,11 @@ exampleSelect.addEventListener('change', async () => {
     renderPlots(loadedData, lastFit);
     if (lastFit) fitBtn.click();
   });
+
+
   resetRangeBtn.addEventListener('click', () => { freqRange = null; rangeInfo.textContent = ''; renderPlots(loadedData, lastFit); if (lastFit) fitBtn.click(); });
+
+
 
   // Circuit generator UI
   function updateCircuitDiagram() {
@@ -972,5 +1164,7 @@ exampleSelect.addEventListener('change', async () => {
 
   // Allow Enter key to trigger generation (kept for usability)
   circuitInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); updateCircuitDiagram(); } });
+
+
 
 })();
