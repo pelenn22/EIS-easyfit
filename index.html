@@ -62,9 +62,14 @@
     <option value="R-(R)(P)">R-(R)(P)</option>
     <option value="R-(R)(P)-(R)(P)">R-(R)(P)-(R)(P)</option>
   </select>
-  <div id="circuitDiagram" class="circuit-diagram" style="border:1px solid #dde1e6; padding:8px; background:#fff;"></div>
+  <div style="display:flex; align-items:flex-start; gap:12px;">
+  <div id="circuitDiagram" class="circuit-diagram" style="border:1px solid #dde1e6; padding:8px; background:#fff; flex:1; min-width:200px;"></div>
+  <div id="paramSettings" style="margin-top:0; flex:0 0 auto; width:200px;"></div>
+</div>
+
   <button id="fitBtn" disabled>Fit</button>
-    <button id="kkBtn" disabled style="display:none;">Kramers‑Kronig Test</button>
+    <button id="kkBtn" disabled>Kramers‑Kronig Test</button>
+
 </section>
 
 <div class="plots">

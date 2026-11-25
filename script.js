@@ -27,6 +27,8 @@
   let lastFit = null;      // {names, values, modelKey, node}
   let freqRange = null;    // {min, max} in Hz, or null for the full range
   let customCircuit = null;// {root, params: [{name, unit, guess}]}
+let userStartValues = null;
+let userParamBounds = null;
 
   // ---------- Parsing (data file) ----------
 
@@ -118,25 +120,29 @@
       const n = Number(clean);
       return isFinite(n) ? n : null;
     };
+    // If a header was recognised but some column could not be mapped, indexing
+    // with -1 used to throw (tokens[-1] is undefined). Let the simple fallback
+    // parser at the end handle such files instead.
+    const mapped = colIdx.freq >= 0 && colIdx.re >= 0 && colIdx.im >= 0;
 
-    for (let i = startIdx; i < rawLines.length; i++) {
+    const rows = [];
+
+    for (let i = startIdx; mapped && i < rawLines.length; i++) {
       const tokens = rawLines[i].trim().split(bestDelim);
       if (tokens.length < 3) continue;
-      const f = toNumber(tokens[colIdx.freq]);
-      const zr = toNumber(tokens[colIdx.re]);
-      const imRaw = toNumber(tokens[colIdx.im]);
+      const at = (idx) => (idx < tokens.length) ? tokens[idx] : '';
+      const f = toNumber(at(colIdx.freq));
+      const zr = toNumber(at(colIdx.re));
+      const imRaw = toNumber(at(colIdx.im));
       if (f === null || zr === null || imRaw === null) continue;
       // Basic sanity checks
       if (f < 1e-3 || f > 1e7) continue;
       if (zr <= 0) continue;
-      const im = imRaw < 0 ? -imRaw : -imRaw; // ensure positive -Im
-      freq.push(f);
-      zreal.push(zr);
-      minusImZ.push(im);
+      rows.push([f, zr, imRaw]);
     }
 
     // Fallback: simple split if we got too few rows after intelligent parsing
-    if (freq.length < 2) {
+    if (rows.length < 2) {
       const lines = text.split(/\r?\n/);
       for (const line of lines) {
         const toks = line.trim().split(/[\s,;]+/);
@@ -145,9 +151,23 @@
         if (f === null || zr === null || imRaw === null) continue;
         if (f < 1e-3 || f > 1e7) continue;
         if (zr <= 0) continue;
-        const im = imRaw < 0 ? -imRaw : imRaw;
-        freq.push(f); zreal.push(zr); minusImZ.push(im);
+        rows.push([f, zr, imRaw]);
       }
+    }
+
+    // The imaginary column of an export holds either Im(Z) (negative for
+    // capacitive data) or -Im(Z) (positive). The convention is decided once for
+    // the whole file from the majority of its values. Flipping every point
+    // keeps a genuinely inductive branch (where -Im(Z) is negative) physical;
+    // taking the absolute value point by point mirrored such points onto the
+    // capacitive side and so corrupted the spectrum.
+    let negIm = 0;
+    for (const r of rows) if (r[2] < 0) negIm++;
+    const flipIm = negIm * 2 > rows.length;
+    for (const r of rows) {
+      freq.push(r[0]);
+      zreal.push(r[1]);
+      minusImZ.push(flipIm ? -r[2] : r[2]);
     }
     return {freq, zreal, minusImZ};
   }
@@ -303,15 +323,129 @@
     return evalNode(root);
   }
 
+  // Characteristic scales of a spectrum: the size of its impedance and the
+  // angular frequency where the imaginary response is strongest (the apex of
+  // the arc). Anchoring on the apex instead of on the highest measured
+  // frequency is what makes the guesses usable: a spectrum measured from
+  // 0.1 Hz to 8 MHz has nothing in common with one from 1 kHz to 1 Hz.
+  function spectrumScales(data) {
+    const posOr = (x, d) => (isFinite(x) && x > 0) ? x : d;
+    const n = (data && data.freq) ? data.freq.length : 0;
+    if (!n) return null;                     // nothing loaded: use the catalogue guesses
+    let maxRe = -Infinity, k = 0, fMin = Infinity, fMax = 0;
+    for (let i = 0; i < n; i++) {
+      if (data.zreal[i] > maxRe) maxRe = data.zreal[i];
+      if (data.minusImZ[i] > data.minusImZ[k]) k = i;
+      if (data.freq[i] < fMin) fMin = data.freq[i];
+      if (data.freq[i] > fMax) fMax = data.freq[i];
+    }
+    // A series inductance is the only thing that can turn -Im(Z) negative, and
+    // where it dominates -Im = -w*L, so (-Im)/w is a direct estimate of it.
+    // Without that estimate an inductance is guessed from the arc and can be off
+    // by orders of magnitude. Only the top decade of the spectrum is used, which
+    // is where an inductance lives, and the median of those ratios rather than
+    // the largest: one noisy point elsewhere whose -Im just dips below zero makes
+    // (-Im)/w huge at a low frequency, and since the bounds are derived from the
+    // start, the true value then falls below Min and the fitted inductance sits
+    // pinned at its bound while resistance and capacitance compensate around it.
+    const lAll = [], lHi = [];
+    for (let i = 0; i < n; i++) {
+      if (!(data.minusImZ[i] < 0) || !isFinite(data.freq[i])) continue;
+      const li = -data.minusImZ[i] / (2 * Math.PI * Math.max(data.freq[i], 1e-9));
+      if (isFinite(li) && li > 0) {
+        lAll.push(li);
+        if (data.freq[i] * 10 >= fMax) lHi.push(li);
+      }
+    }
+    const lSample = (lHi.length ? lHi : lAll).sort((a, b) => a - b);
+    return {
+      r: posOr(Math.max(maxRe, data.minusImZ[k]), 1),      // ohms
+      w: posOr(2 * Math.PI * data.freq[k], 2 * Math.PI),   // rad/s at that apex
+      wLo: posOr(2 * Math.PI * (isFinite(fMin) ? fMin : 1), 2 * Math.PI), // rad/s at the lowest measured frequency
+      l: lSample.length ? lSample[(lSample.length - 1) >> 1] : 0   // henries, 0 if not inductive
+    };
+  }
+
+  // Value of an element whose |Z| equals the spectrum scale at the Debye apex
+  // (frequency w), or at the low-frequency limit (wLo) for elements that only
+  // express themselves there: C = 1/(wR), I = R/w, Q = 1/(R*sqrt(w)), W = R*sqrt(wLo).
+  function elementValueScale(p, s) {
+    if (!s) return p.guess;
+    switch (p.name[0]) {
+      case 'R': return s.r;
+      case 'C': return 1 / (s.r * s.w);
+      case 'I': return s.l > 0 ? s.l : s.r / s.w;   // measured inductive branch wins
+      // A Warburg only shows up at the low-frequency end (its impedance grows as
+      // 1/sqrt(w)), so it has to be anchored there. Anchoring it on the arc apex
+      // makes the coefficient sqrt(w_apex/w_lo) too large: on example-data-01,
+      // whose apex sits four decades above the lowest frequency, that start is
+      // 135x the measured impedance, the residual of the first iteration is
+      // dominated by the element itself, and the fit never recovers - a series
+      // Warburg then stalls around 1.8e4 and reports a 2580 % misfit as if the
+      // circuit were wrong.
+      case 'W': return s.r * Math.sqrt(s.wLo);
+      case 'P':
+      case 'Q': return 1 / (s.r * Math.sqrt(s.w));
+      default: return p.guess;                 // dimensionless exponents
+    }
+  }
+
   function circuitInitialGuesses(params, data) {
-    const maxRe = Math.max.apply(null, data.zreal);
-    const rCount = params.filter(p => p.name[0] === 'R').length;
+    const s = spectrumScales(data);
+    const rCount = params.filter(p => p.name[0] === 'R').length || 1;
     return params.map(p => {
-      if (p.name[0] === 'R') return Math.max(maxRe / (rCount || 1), 1);
-      return p.guess;
+      if (!s) return p.guess;
+      return p.name[0] === 'R'
+        ? Math.max(s.r / rCount, s.r * 1e-6)   // split the measured resistance over the R's
+        : elementValueScale(p, s);
     });
+  }
 
+  // Everything derived from a guess is shown with three significant figures:
+  // these numbers only ever carry order-of-magnitude meaning, and a 16-digit
+  // bound in a text field hides the fact that it is an estimate.
+  const SIG_DIGITS = 3;
+  function roundSig(x) {
+    if (!isFinite(x) || x === 0) return 0;
+    const e = Math.floor(Math.log10(Math.abs(x)));
+    const factor = Math.pow(10, SIG_DIGITS - 1 - e);
+    return Math.round(x * factor) / factor;
+  }
+  // Display form with SIG_DIGITS significant figures, with the exponent written
+  // out only where the plain number would be a wall of zeros or of nines.
+  function fmtSig(x) {
+    if (typeof x !== 'number' || !isFinite(x)) return '';
+    if (x === 0) return '0';
+    const a = Math.abs(x);
+    return (a < 1e-3 || a >= 1e4) ? x.toExponential(SIG_DIGITS - 1) : String(roundSig(x));
+  }
 
+  // Guess start values (3 significant figures) and fitting bounds
+  function guessStartAndBounds(params, data) {
+    const s = spectrumScales(data);
+    const rCount = params.filter(p => p.name[0] === 'R').length || 1;
+    const posOr = (x, d) => (isFinite(x) && x > 0) ? x : d;
+    const starts = params.map(p => {
+      const raw = !s ? p.guess
+        : (p.name[0] === 'R') ? Math.max(s.r / rCount, s.r * 1e-6)
+        : elementValueScale(p, s);
+      const v = roundSig(raw);
+      return v > 0 ? v : posOr(raw, 0);      // never round a small element to zero
+    });
+    // Bounds are deliberately wide (4 decades around the element's own scale).
+    // A parameter pinned at a tight default limit stops the fit silently and
+    // the leftover residual then looks like a mistake in the circuit, not in
+    // the bounds. Only the dimensionless exponent gets a physical window.
+    const bounds = params.map((p, i) => {
+      const g = starts[i];
+      if (p.name[0] === 'n') return [0.2, 1.0];
+      if (p.name[0] === 'R') return [0, posOr(roundSig(Math.max(g, s ? s.r : g) * 1e4), 1)];
+      const scale = elementValueScale(p, s);
+      const lo = Math.min(g, scale) * 1e-4;
+      const hi = Math.max(g, scale) * 1e4;
+      return [posOr(roundSig(lo), 0), posOr(roundSig(hi), 1)];
+    });
+    return {starts, bounds};
   }
 
   // ---------- Levenberg-Marquardt (built-in) ----------
@@ -356,6 +490,7 @@
     let success = err <= opt.errorTolerance;
     let stopReason = 'converged';
     while (iterations < opt.maxIterations && !success) {
+      const errBefore = err;
       const J = [];
       for (let k = 0; k < n; k++) {
         const h = opt.gradientDifference * (Math.abs(p[k]) > 1e-12 ? Math.abs(p[k]) : 1);
@@ -374,12 +509,28 @@
       let accepted = false;
       for (let tries = 0; tries < 20 && !accepted; tries++) {
         const Ad = A.map((row, i) =>
-          row.map((v, j) => (i === j ? v + lambda * v : v))
+          // Marquardt damping: lambda (absolute) + scaled term, so the step is
+          // damped consistently for parameters of very different magnitudes
+          // (R ~ 1e2 vs C ~ 1e-6). lambda*JtJ alone leaves small-diagonal
+          // directions almost undamped and they overshoot.
+          row.map((v, j) => (i === j ? v + lambda + lambda * v : v))
         );
         for (let i = 0; i < n; i++) if (Math.abs(Ad[i][i]) < 1e-14) Ad[i][i] = 1e-14;
         const delta = lmSolveLinear(Ad, g.map(v => -v));
         if (!delta.every(v => isFinite(v))) { lambda *= 10; continue; }
-        const pNew = p.map((v, i) => v + delta[i]);
+        let pNew = p.map((v, i) => v + delta[i]);
+        // Apply bounds if provided
+        if (opt.bounds) {
+          pNew = pNew.map((val, i) => {
+            const b = opt.bounds[i];
+            if (!b) return val;
+            const low = b[0];
+            const high = b[1];
+            if (low !== undefined && val < low) return low;
+            if (high !== undefined && val > high) return high;
+            return val;
+          });
+        }
         const rNew = residualFunc(pNew);
         if (rNew.some(v => !isFinite(v))) { lambda *= 10; continue; }
         const errNew = rNew.reduce((s, v) => s + Math.abs(v), 0) / rNew.length;
@@ -393,6 +544,13 @@
       }
       iterations++;
       if (!accepted) { stopReason = 'stuck'; break; }
+      // Stop as soon as an accepted step no longer improves the residuals
+      // (scale independent criterion; complements the absolute errorTolerance).
+      if (errBefore - err <= 1e-10 * Math.max(errBefore, opt.errorTolerance)) {
+        success = true;
+        stopReason = 'converged';
+        break;
+      }
       success = err <= opt.errorTolerance;
     }
     if (success) stopReason = 'converged';
@@ -419,18 +577,40 @@
       return res;
     };
 
-    const initial = modelKey === 'Custom'
-      ? circuitInitialGuesses(customCircuit.params, data)
-      : includeWarburg
-        ? [0, Math.max.apply(null, zreal), 1e-5, 1]
-        : [0, Math.max.apply(null, zreal), 1e-5];
-
-    const result = levenbergMarquardt(residual, initial, {
+    // Determine initial guess and optional bounds
+    let initial;
+    // The LM error is the mean |residual| in ohms, so the tolerance must scale
+    // with the impedance of the data: an absolute 1e-3 ohm is reached instantly
+    // for a 10 kohm spectrum (stop before converging) and is unreachable for a
+    // milliohm one (run to max iterations). Relative: 1e-5 of mean |Z|.
+    const zAvg = meanImpedanceMagnitude(data);
+    const lmOptions = {
       damping: 1.5,
       gradientDifference: 1e-6,
       maxIterations: 100,
-      errorTolerance: 1e-3
-    });
+      errorTolerance: Math.max(1e-12, zAvg * 1e-5),
+      bounds: null
+    };
+
+    if (modelKey === 'Custom') {
+      if (userStartValues && userStartValues.length === customCircuit.params.length) {
+        // An emptied Start field is undefined; using it as an initial value
+        // makes every residual NaN and the fit crashes on the way to the table.
+        initial = userStartValues.map((v, i) =>
+          (typeof v === 'number' && isFinite(v)) ? v : customCircuit.params[i].guess);
+      } else {
+        initial = circuitInitialGuesses(customCircuit.params, data);
+      }
+      if (userParamBounds && userParamBounds.length === customCircuit.params.length) {
+        lmOptions.bounds = userParamBounds;
+      }
+    } else {
+      initial = includeWarburg
+        ? [0, Math.max.apply(null, zreal), 1e-5, 1]
+        : [0, Math.max.apply(null, zreal), 1e-5];
+    }
+
+    const result = levenbergMarquardt(residual, initial, lmOptions);
 
 
     return {values: result.parameterValues, error: result.parameterError, iterations: result.iterations, success: result.success, stopReason: result.stopReason};
@@ -601,8 +781,29 @@
     const ix = [], ex = [];
     freq.forEach((f,i) => (mask[i] ? ix : ex).push(i));
 
+    // The K-K verdict used to be the name of the trace it draws, and Plotly sizes
+    // the legend to its longest entry: the whole sentence ended up over half the
+    // Nyquist plot, hiding the points it was talking about. The legend entry is
+    // short now and the message is wrapped into small caption lines above the axes.
+    const caption = (info, width) => {
+      const maxChars = Math.max(24, Math.floor(((width || 420) - 44) / 6.3));
+      const words = String(info).split(' ');
+      const lines = [];
+      let cur = '';
+      words.forEach(w => {
+        if (cur && (cur + ' ' + w).length > maxChars) { lines.push(cur); cur = w; }
+        else cur = cur ? cur + ' ' + w : w;
+      });
+      if (cur) lines.push(cur);
+      // Plotly advances every title line by 1.3em of the title font, 17px by
+      // default, so a caption line costs about 23px of top margin whatever its
+      // own size - measured, not guessed, or the caption sits on the data.
+      return { text: lines.join('<br>'), height: 23 * lines.length };
+    };
+
     let fitTrace = null, fitMag = null, fitPhase = null;
-    if (fit) {
+    if (fit && ix.length >= 2) {
+      // with fewer than 2 points in range there is nothing to draw a curve over
       const fminFit = Math.min.apply(null, ix.map(i => freq[i]));
       const fmaxFit = Math.max.apply(null, ix.map(i => freq[i]));
       const fgrid = logGrid(fminFit, fmaxFit, 200);
@@ -626,22 +827,51 @@
 
 
     const nyqTraces = [pts(ix, DATA_COLOR, 'Data', 6)];
+    let kkNote = '';
       if (showKK) {
-        const kkBad = computeKKBad(data);
-        if (kkBad.length) nyqTraces.push(pts(kkBad, '#ff0000', 'KK violation', 8));
+        // test the points that are actually selected for the fit
+        const kkData = {
+          freq: ix.map(i => freq[i]),
+          zreal: ix.map(i => zreal[i]),
+          minusImZ: ix.map(i => minusImZ[i])
+        };
+        const kk = computeKK(kkData);
+        nyqTraces.push(pts(kk.bad.map(t => ix[t]), '#ff0000', 'K-K', 9));
+        kkNote = kk.info;
       }
     if (ex.length) nyqTraces.push(pts(ex, EXCLUDED_COLOR, 'Data (excluded)', 6));
     if (fitTrace) nyqTraces.push(fitTrace);
+    // Wrap to the width the plot is drawn at, not to the div's: Plotly keeps the
+    // canvas size of an existing plot, so after a window resize the two differ
+    // and the caption would spill past the edge of the figure.
+    const nyqEl = document.getElementById('nyquist');
+    const drawn = nyqEl.querySelector('svg');
+    const nyqW = (drawn && drawn.getBoundingClientRect().width) || nyqEl.clientWidth;
+    const kkCaption = kkNote ? caption(kkNote, nyqW) : null;
+    // The verdict is a subtitle of the plot rather than a legend entry or an
+    // in-plot note: it is a sentence, it has to stay readable on a narrow plot,
+    // and nothing of it may cover the points it describes.
+    const nyqTitle = {
+      text: 'Nyquist Plot' + (kkCaption
+        ? '<br><span style="font-size:11px;font-weight:normal;color:#555">' + kkCaption.text + '</span>'
+        : '')
+    };
+    if (kkCaption) {
+      // Left to itself Plotly floats the title in the middle of the top margin,
+      // so every caption line would cost twice the room it needs. Pinning the
+      // block just below the top edge of the figure (0.945 of the 420px plot,
+      // i.e. the first line's own height) keeps it clear of the axes.
+      nyqTitle.y = 0.945;
+      nyqTitle.yanchor = 'top';
+    }
     Plotly.react('nyquist', nyqTraces, {
-      title: 'Nyquist Plot',
+      title: nyqTitle,
       xaxis: {title: 'Re(Z) (Ω)', scaleanchor: 'y', scaleratio: 1},
       yaxis: {title: '-Im(Z) (Ω)'},
-      margin: {l: 60, r: 20, t: 40, b: 50},
+      margin: {l: 60, r: 20, t: kkCaption ? 30 + kkCaption.height : 40, b: 50},
       hovermode: 'closest',
       plot_bgcolor: '#fff'
     });
-
-
 
     // Bode magnitude
     const mag = zreal.map((r,i) => Math.sqrt(r*r + zimag[i]*zimag[i]));
@@ -692,36 +922,190 @@
 
   }
 
-  // ---------- Kramer‑Kronig Test ----------
-let showKK = false;
-function computeKKBad(data) {
-  const {zreal, minusImZ} = data;
-  const ratios = zreal.map((r,i) => r / minusImZ[i]);
-  const sorted = ratios.slice().sort((a,b)=>a-b);
-  const median = sorted[Math.floor(sorted.length/2)];
-  const bad = [];
-  ratios.forEach((v,i)=>{ const rel = v/median; if (rel > 5 || rel < 0.2) bad.push(i); });
+  // ---------- Kramers-Kronig Test ----------
+  let showKK = false;
 
+  // Kramers-Kronig test for causality of the imaginary part.
+  // Causality ties the two parts of an impedance together. Every element of
+  //     Z(w) = Rinf + SUM_k Rk / (1 + (j w tk)^nk),   0 < nk <= 1
+  // is causal on its own, so fitting the *measured real part* with a few of
+  // these elements determines the imaginary part completely - the imaginary
+  // part is never used to fit the model that then predicts it. A smooth causal
+  // response cannot follow a single artefact, so the difference between the
+  // predicted and the measured imaginary part exposes K-K violations. The
+  // deviations are judged relative to |Z| and against their own median, which
+  // flags outliers instead of the noise band of an otherwise good spectrum.
+  function computeKK(data) {
+    const none = {bad: [], info: 'K-K test unavailable'};
+    const n = data.freq.length;
+    if (n < 8) return none;                        // too few points to fit a model
+    const w = data.freq.map(f => 2 * Math.PI * f);
+    let iLo = 0, iHi = 0, apex = 0;
+    for (let i = 1; i < n; i++) {
+      if (data.freq[i] < data.freq[iLo]) iLo = i;
+      if (data.freq[i] > data.freq[iHi]) iHi = i;
+      if (data.minusImZ[i] > data.minusImZ[apex]) apex = i;
+    }
+    let reMin = Infinity, reMax = -Infinity, imMax = 0;
+    for (let i = 0; i < n; i++) {
+      if (data.zreal[i] < reMin) reMin = data.zreal[i];
+      if (data.zreal[i] > reMax) reMax = data.zreal[i];
+      if (data.minusImZ[i] > imMax) imMax = data.minusImZ[i];
+    }
+    // Size of the spectrum: every tolerance below is a fraction of it and never
+    // an absolute number of ohms.
+    const arc = Math.max(imMax, reMax - reMin, 1e-12);
+    const tauMin = 1 / (2 * Math.PI * data.freq[iHi]);
+    const tauMax = 1 / (2 * Math.PI * Math.max(data.freq[iLo], 1e-12));
+    const tauApex = 1 / (2 * Math.PI * Math.max(data.freq[apex], 1e-12));
+    const rInf0 = data.zreal[iHi];
+    const span0 = Math.max(reMax - rInf0, 0.2 * arc);
 
-  return bad;
-}
-// ---------- Results ----------
+    // Real and (-)imaginary part of Rinf + SUM Rk/(1+(jwt)^nk).
+    const ccParts = (p) => {
+      const re = new Array(n), im = new Array(n);
+      const m = (p.length - 1) / 3;
+      for (let i = 0; i < n; i++) {
+        let reI = p[0], imI = 0;
+        for (let k = 0; k < m; k++) {
+          const R = p[1 + 3 * k];
+          const tau = Math.exp(p[2 + 3 * k]);
+          const nk = p[3 + 3 * k];
+          const u = Math.pow(w[i] * tau, nk);
+          const c = Math.cos(nk * Math.PI / 2), s = Math.sin(nk * Math.PI / 2);
+          const den = (1 + u * c) * (1 + u * c) + (u * s) * (u * s);
+          reI += R * (1 + u * c) / den;
+          imI += R * u * s / den;
+        }
+        re[i] = reI;
+        im[i] = imI;
+      }
+      return {re, im};
+    };
 
-  function renderFitTable(names, values, meta, error, absErrors = []) {
+    // One to three elements; an extra one is accepted only when it clearly
+    // lowers the real-part misfit (a broad or double arc needs several).
+    let best = null;
+    for (let m = 1; m <= 3; m++) {
+      const p0 = [rInf0];
+      const bounds = [[0, Infinity]];
+      for (let k = 0; k < m; k++) {
+        const frac = (m === 1) ? 0 : k / (m - 1);
+        const tau = (m === 1) ? tauApex
+          : tauMin * Math.pow(Math.max(tauMax / tauMin, 10), frac);
+        p0.push(span0 / m, Math.log(tau), 0.9);
+        bounds.push([0, Infinity],
+          [Math.log(tauMin) - 2, Math.log(tauMax) + 2], [0.05, 1]);
+      }
+      const fit = levenbergMarquardt((p) => {
+        const parts = ccParts(p);
+        return data.zreal.map((v, i) => (parts.re[i] - v) / arc);
+      }, p0, {
+        bounds: bounds,
+        damping: 1e-2,
+        maxIterations: 250,
+        // the residuals are already normalised by the size of the spectrum
+        errorTolerance: 1e-9
+      });
+      if (!fit.parameterValues.every(v => isFinite(v))) continue;
+      if (!best || fit.parameterError < best.error * 0.7) {
+        best = {values: fit.parameterValues, error: fit.parameterError, elements: m};
+      }
+    }
+    if (!best || !isFinite(best.error)) return none;
+
+    const pred = ccParts(best.values);
+    let dev = data.minusImZ.map((v, i) => v - pred.im[i]);
+    const medianAbs = (arr) => {
+      const s = arr.map(v => Math.abs(v)).sort((a, b) => a - b);
+      return s[Math.floor(s.length / 2)] || 0;
+    };
+    // A series inductance (cable, cell holder) is causal as well, so its
+    // contribution -Im(w) = -w*L is removed before judging. It is kept only
+    // when it really tightens the residuals, otherwise a fit parameter would
+    // absorb part of the data the test is supposed to check.
+    let num = 0, den = 0;
+    for (let i = 0; i < n; i++) { num -= dev[i] * w[i]; den += w[i] * w[i]; }
+    const L = den > 0 ? Math.max(0, num / den) : 0;
+    if (L > 0) {
+      const withL = dev.map((v, i) => v + L * w[i]);
+      if (medianAbs(withL) < medianAbs(dev)) dev = withL;
+    }
+    const rel = dev.map((v, i) =>
+      Math.abs(v) / Math.max(Math.hypot(data.zreal[i], data.minusImZ[i]), 1e-12));
+    const medRel = medianAbs(rel);
+    const limit = Math.max(6 * medRel, 0.002);   // at least 0.2 % of |Z|
+    // When a handful of causal elements cannot keep up with the imaginary part
+    // anywhere near the real part's accuracy, the deviation is a property of the
+    // model and not of the data: every point would look wrong, so no point is
+    // claimed. The message says what was measured instead.
+    const inconclusive = medRel > 0.05;
+    const bad = [];
+    if (!inconclusive) {
+      for (let i = 0; i < n; i++) if (rel[i] > limit) bad.push(i);
+    }
+    const info = 'K-K: ' + best.elements +
+      (best.elements > 1 ? ' causal elements, ' : ' causal element, ') +
+      'real part fitted to ' + (100 * best.error).toPrecision(2) + '%, ' +
+      (inconclusive
+        ? 'test inconclusive (typical deviation ' + (100 * medRel).toPrecision(2) + '% of |Z|: response needs more than a few relaxation times)'
+        : 'median deviation ' + (100 * medRel).toPrecision(2) + '% of |Z|, ' +
+          bad.length + '/' + n + ' points deviate (limit ' + (100 * limit).toPrecision(2) + '% of |Z|)');
+    return {bad: bad, info: info};
+  }
+
+  // ---------- Results ----------
+
+  // Mean |Z| of a spectrum — the scale a residual has to be compared with.
+  function meanImpedanceMagnitude(data) {
+    if (!data || !data.freq || !data.freq.length) return 0;
+    let s = 0;
+    for (let i = 0; i < data.freq.length; i++) s += Math.hypot(data.zreal[i], data.minusImZ[i]);
+    return s / data.freq.length;
+  }
+
+  function renderFitTable(names, values, meta, error, absErrors = [], zScale = 0) {
     const div = document.getElementById('fitResults');
-    // Determine quality based on overall residual error
+    // Fit quality: the residual relative to the size of the spectrum. An
+    // absolute threshold in ohms labels a well-fitted 1e5 Ω dataset "Bad"
+    // because 3 Ω is nothing there, and a badly fitted 1 Ω one "Good".
+    const relQuality = zScale > 0 ? error / zScale : Infinity;
     let qualityClass = 'good';
     let qualityLabel = 'Good';
-    if (error >= 2) { qualityClass = 'bad'; qualityLabel = 'Bad'; }
-    else if (error >= 0.5) { qualityClass = 'moderate'; qualityLabel = 'Moderate'; }
+    if (relQuality >= 0.05) { qualityClass = 'bad'; qualityLabel = 'Bad'; }
+    else if (relQuality >= 0.01) { qualityClass = 'moderate'; qualityLabel = 'Moderate'; }
     let html = '<h2>Fitted Parameters</h2><table><tr><th>Parameter</th><th>Value</th><th>Abs. Error</th><th>Rel. Error (%)</th></tr>';
+    const atLimit = [];
     names.forEach((n,i) => {
-      const val = values[i].toExponential(6);
-      const absErr = absErrors[i] !== undefined && !isNaN(absErrors[i]) ? absErrors[i].toExponential(3) : '—';
-      const relErr = (absErrors[i] !== undefined && values[i] !== 0 && !isNaN(absErrors[i])) ? (absErrors[i]/Math.abs(values[i])*100).toFixed(2) : '—';
-      html += '<tr><td>' + n + '</td><td><span class="fit-quality ' + qualityClass + '">' + val + '</span></td><td>' + absErr + '</td><td>' + relErr + '</td></tr>';
+      const v = values[i];
+      const ok = typeof v === 'number' && isFinite(v);
+      let val = ok ? v.toExponential(SIG_DIGITS - 1) : '—';
+      const err = (absErrors[i] !== undefined && isFinite(absErrors[i])) ? absErrors[i] : NaN;
+      const absErr = isNaN(err) ? '—' : err.toExponential(SIG_DIGITS - 1);
+      // A parameter held by one of its limits tells nothing about the system -
+      // its value is the limit, not a measurement - so say so instead of
+      // presenting it as a fitted number.
+      const b = (userParamBounds && userParamBounds.length > i) ? userParamBounds[i] : null;
+      if (ok && b) {
+        const low = b[0], high = b[1];
+        if (low !== undefined && low !== null && Math.abs(v - low) <= 1e-6 * Math.max(Math.abs(low), Math.abs(high) * 1e-12, 1e-30)) {
+          val += ' (at Min)'; atLimit.push(n);
+        } else if (high !== undefined && high !== null && Math.abs(v - high) <= 1e-6 * Math.abs(high)) {
+          val += ' (at Max)'; atLimit.push(n);
+        }
+      }
+      // A parameter that ran to a bound (or to ~0) gets an enormous, useless
+      // relative error: show it in exponential form instead of 29199165476.49.
+      const rel = (!isNaN(err) && ok && v !== 0) ? err / Math.abs(v) * 100 : NaN;
+      const relTxt = isNaN(rel) ? '—'
+        : (rel >= 1000 ? rel.toExponential(SIG_DIGITS - 1) : rel.toPrecision(SIG_DIGITS));
+      html += '<tr><td>' + n + '</td><td><span class="fit-quality ' + qualityClass + '">' + val + '</span></td><td>' + absErr + '</td><td>' + relTxt + '</td></tr>';
     });
 
+    if (atLimit.length) {
+      html += '<tr><td>At a limit</td><td colspan="3">' + atLimit.join(', ') +
+        ' could not move past its bound. Widen Start/Min/Max for these, or the element is not present in the data.</td></tr>';
+    }
 
     // Add fit quality row (spanning three columns for value+errors)
     html += '<tr><td>Fit quality</td><td colspan="3"><span class="fit-quality ' + qualityClass + '">' + qualityLabel + '</span></td></tr>';
@@ -755,6 +1139,85 @@ function computeKKBad(data) {
     return modelKey === 'Custom'
       ? customCircuit.params.map(p => p.name + ' (' + p.unit + ')')
       : paramNames(modelKey);
+  }
+
+  // Render UI for start values and bounds of circuit parameters
+  function renderParamControls(params) {
+    const container = document.getElementById('paramSettings');
+    container.innerHTML = '';
+    if (!params || params.length === 0) return;
+    const table = document.createElement('table');
+    const header = document.createElement('tr');
+    header.innerHTML = '<th>Param</th><th>Start</th><th>Min</th><th>Max</th>';
+    table.appendChild(header);
+    params.forEach((p, i) => {
+      const row = document.createElement('tr');
+      const nameTd = document.createElement('td');
+      nameTd.textContent = p.name + ' (' + p.unit + ')';
+      const startTd = document.createElement('td');
+      const startIn = document.createElement('input');
+      startIn.type = 'number';
+      startIn.step = 'any';
+      startIn.dataset.idx = i;
+      startIn.dataset.field = 'start';
+      const startVal = (userStartValues && userStartValues[i] !== undefined) ? userStartValues[i] : p.guess;
+      if (typeof startVal === 'number' && isFinite(startVal)) startIn.value = fmtSig(startVal);
+      startTd.appendChild(startIn);
+
+      const minTd = document.createElement('td');
+      const minIn = document.createElement('input');
+      minIn.type = 'number';
+      minIn.step = 'any';
+      minIn.dataset.idx = i;
+      minIn.dataset.field = 'min';
+      if (userParamBounds && userParamBounds[i]) {
+        const low = userParamBounds[i][0];
+        if (typeof low === 'number' && isFinite(low)) minIn.value = fmtSig(low);
+      }
+      minTd.appendChild(minIn);
+
+      const maxTd = document.createElement('td');
+      const maxIn = document.createElement('input');
+      maxIn.type = 'number';
+      maxIn.step = 'any';
+      maxIn.dataset.idx = i;
+      maxIn.dataset.field = 'max';
+      if (userParamBounds && userParamBounds[i]) {
+        const high = userParamBounds[i][1];
+        if (typeof high === 'number' && isFinite(high)) maxIn.value = fmtSig(high);
+      }
+      maxTd.appendChild(maxIn);
+
+      row.appendChild(nameTd);
+      row.appendChild(startTd);
+      row.appendChild(minTd);
+      row.appendChild(maxTd);
+      table.appendChild(row);
+    });
+    container.appendChild(table);
+
+    // Listen for changes to update globals. The container element is reused on
+    // every render, so drop the previous listener first (otherwise one more
+    // handler is added each time the table is redrawn).
+    if (container._paramHandler) container.removeEventListener('input', container._paramHandler);
+    container._paramHandler = (e) => {
+      const idx = Number(e.target.dataset.idx);
+      const field = e.target.dataset.field;
+      const valStr = e.target.value.trim();
+      const num = Number(valStr);
+      const val = (valStr === '' || !isFinite(num)) ? undefined : num;
+      if (field !== 'start' && field !== 'min' && field !== 'max') return;
+      if (field === 'start') {
+        if (!userStartValues) userStartValues = new Array(params.length).fill(undefined);
+        userStartValues[idx] = val;
+      } else {
+        if (!userParamBounds) userParamBounds = new Array(params.length).fill(undefined);
+        if (!userParamBounds[idx]) userParamBounds[idx] = [undefined, undefined];
+        if (field === 'min') userParamBounds[idx][0] = val;
+        if (field === 'max') userParamBounds[idx][1] = val;
+      }
+    };
+    container.addEventListener('input', container._paramHandler);
   }
 
   // ---------- UI wiring ----------
@@ -822,10 +1285,17 @@ async function populateExampleFiles() {
         exampleSelect.appendChild(opt);
       }
     });
+    exampleSelect.disabled = false;
 
 
   } catch (e) {
     console.error('Failed to fetch example list:', e);
+    // The page also works from file:// or without network, where this list can
+    // never arrive; say so in the control instead of leaving an empty dropdown.
+    if (exampleSelect.options.length) {
+      exampleSelect.options[0].textContent = 'Example files unavailable (no network?)';
+      exampleSelect.disabled = true;
+    }
   }
 }
 populateExampleFiles();
@@ -835,7 +1305,9 @@ exampleSelect.addEventListener('change', async () => {
   const fileName = exampleSelect.value;
   if (!fileName) return;
 
-  const rawUrl = `https://raw.githubusercontent.com/pelenn22/EIS-easyfit/main/Example%20data/${fileName}`;
+  // The name comes from the GitHub listing, so it may contain characters that
+  // have a meaning inside a URL (space, '#', '%').
+  const rawUrl = `https://raw.githubusercontent.com/pelenn22/EIS-easyfit/main/Example%20data/${encodeURIComponent(fileName)}`;
   try {
     const resp = await fetch(rawUrl);
     if (!resp.ok) throw new Error(`Cannot fetch ${fileName}: ${resp.status}`);
@@ -859,6 +1331,13 @@ exampleSelect.addEventListener('change', async () => {
     rangeInfo.textContent = '';
     rangePanel.style.display = 'flex';
     renderPlots(data, null);
+    // update start values & UI after loading data (example)
+    if (customCircuit) {
+      const {starts, bounds} = guessStartAndBounds(customCircuit.params, data);
+      userStartValues = starts;
+      userParamBounds = bounds;
+      renderParamControls(customCircuit.params);
+    }
     fitBtn.disabled = false; kkBtn.disabled = false;
   } catch (err) {
     alert('Failed to load example data: ' + err.message);
@@ -893,6 +1372,13 @@ exampleSelect.addEventListener('change', async () => {
       rangeInfo.textContent = '';
       rangePanel.style.display = 'flex';
       renderPlots(data, null);
+      // update start values & UI after loading data
+      if (customCircuit) {
+        const {starts, bounds} = guessStartAndBounds(customCircuit.params, data);
+        userStartValues = starts;
+        userParamBounds = bounds;
+        renderParamControls(customCircuit.params);
+      }
       fitBtn.disabled = false; kkBtn.disabled = false;
     };
     reader.readAsText(file);
@@ -991,14 +1477,16 @@ exampleSelect.addEventListener('change', async () => {
       const stopLabel = success
         ? 'converged'
         : stopReason === 'maxIterations' ? 'max iterations reached' : 'no further improvement';
+      const zScale = meanImpedanceMagnitude(data);
       let meta = 'Model: Custom circuit' +
-        ' — mean |residual|: ' + error.toExponential(3) + ' Ω' +
+        ' — mean |residual|: ' + error.toExponential(SIG_DIGITS - 1) + ' Ω' +
+        (zScale > 0 ? ' (' + (error / zScale * 100).toPrecision(SIG_DIGITS) + ' % of |Z|)' : '') +
         ' — iterations: ' + iterations + ' — ' + stopLabel;
       if (rangeRestricted()) {
         const b = rangeBounds();
         meta += ' — fit range: ' + formatFreq(b.min) + ' – ' + formatFreq(b.max) + ' Hz (' + data.freq.length + '/' + loadedData.freq.length + ' points)';
       }
-      renderFitTable(names, values, meta, error, absErrors);
+      renderFitTable(names, values, meta, error, absErrors, zScale);
       downloadBtn.disabled = false;
       renderPlots(loadedData, lastFit);
     } catch (err) {
@@ -1017,7 +1505,8 @@ exampleSelect.addEventListener('change', async () => {
     lastFit.names.forEach((n, i) => {
       const val = lastFit.values[i];
       const absErr = lastFit.absErrors && lastFit.absErrors[i] !== undefined ? lastFit.absErrors[i] : '';
-      const relErr = (absErr !== '' && val !== 0 && !isNaN(absErr)) ? (absErr / Math.abs(val) * 100).toFixed(2) : '';
+      const rel = (absErr !== '' && val !== 0 && !isNaN(absErr)) ? absErr / Math.abs(val) * 100 : '';
+      const relErr = rel === '' ? '' : (rel >= 1000 ? rel.toExponential(1) : rel.toFixed(2));
       allRows.push([n, val, absErr, relErr]);
     });
 
@@ -1042,8 +1531,10 @@ exampleSelect.addEventListener('change', async () => {
     } else {
       fitPoints = modelZ(lastFit.values, f, lastFit.modelKey === 'RandlesWarburg');
     }
-    fitPoints.forEach(z => {
-      allRows.push([z.freq, z.real, -z.imag]);
+    // circuitZ()/modelZ() return {real, imag} only, so take the frequencies
+    // from the fit grid itself (z.freq used to be undefined -> empty column)
+    fitPoints.forEach((z, i) => {
+      allRows.push([f[i], z.real, -z.imag]);
     });
 
 
@@ -1146,8 +1637,17 @@ exampleSelect.addEventListener('change', async () => {
       const svg = buildCircuitSVG(root);
       circuitDiagram.innerHTML = svg;
       circuitError.textContent = '';
-      
-      
+      // initialise start values (use data if already loaded)
+      if (loadedData) {
+         const {starts, bounds} = guessStartAndBounds(customCircuit.params, loadedData);
+         userStartValues = starts;
+         userParamBounds = bounds;
+       } else {
+         userStartValues = circuitInitialGuesses(customCircuit.params, {freq: [], zreal: [], minusImZ: []});
+         // no data to scale the bounds from: let the fit use its own guesses
+         userParamBounds = null;
+       }
+       renderParamControls(customCircuit.params);
     } catch (e) {
       circuitDiagram.innerHTML = '';
       circuitError.textContent = e.message;
