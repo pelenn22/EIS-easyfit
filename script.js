@@ -129,7 +129,7 @@
       // Basic sanity checks
       if (f < 1e-3 || f > 1e7) continue;
       if (zr <= 0) continue;
-      const im = imRaw < 0 ? -imRaw : imRaw; // ensure positive -Im
+      // const im = imRaw < 0 ? -imRaw : imRaw; // ensure positive -Im
       freq.push(f);
       zreal.push(zr);
       minusImZ.push(im);
