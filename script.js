@@ -132,7 +132,7 @@
       // const im = imRaw < 0 ? -imRaw : -imRaw; // ensure positive -Im
       freq.push(f);
       zreal.push(zr);
-      minusImZ.push(im);
+      // minusImZ.push(im);
     }
 
     // Fallback: simple split if we got too few rows after intelligent parsing
