@@ -368,12 +368,21 @@ let userParamBounds = null;
 
   // Value of an element whose |Z| equals the spectrum scale at the Debye apex
   // (frequency w), or at the low-frequency limit (wLo) for elements that only
-  // express themselves there: C = 1/(wR), I = R/w, Q = 1/(R*sqrt(w)), W = R*sqrt(wLo).
+  // express themselves there: C = 1/(wR), I = R/w, Q = 1/(wR), W = R*sqrt(wLo).
   function elementValueScale(p, s) {
     if (!s) return p.guess;
     switch (p.name[0]) {
       case 'R': return s.r;
       case 'C': return 1 / (s.r * s.w);
+      // A constant phase element is guessed as if its exponent were the one it
+      // starts from, n = 1, where it *is* a capacitor: |Z| = 1/(Q w^n). Pairing
+      // the coefficient with another exponent (w with a square root, i.e. n = 1/2)
+      // starts the branch with n and Q apart from each other, and for an almost
+      // ideal arc that puts Q two orders above its own solution - enough that the
+      // fit wanders off to n at its lower bound and the parallel resistance at
+      // zero instead of climbing to n = 1 (randles.txt with R-(P)(R-W): 24 %).
+      case 'P':
+      case 'Q': return 1 / (s.r * s.w);
       case 'I': return s.l > 0 ? s.l : s.r / s.w;   // measured inductive branch wins
       // A Warburg only shows up at the low-frequency end (its impedance grows as
       // 1/sqrt(w)), so it has to be anchored there. Anchoring it on the arc apex
@@ -384,8 +393,6 @@ let userParamBounds = null;
       // Warburg then stalls around 1.8e4 and reports a 2580 % misfit as if the
       // circuit were wrong.
       case 'W': return s.r * Math.sqrt(s.wLo);
-      case 'P':
-      case 'Q': return 1 / (s.r * Math.sqrt(s.w));
       default: return p.guess;                 // dimensionless exponents
     }
   }
@@ -476,7 +483,7 @@ let userParamBounds = null;
     const opt = Object.assign({
       damping: 1.5,
       gradientDifference: 1e-6,
-      maxIterations: 100,
+      maxIterations: 500,
       errorTolerance: 1e-3
     }, options || {});
 
@@ -587,7 +594,7 @@ let userParamBounds = null;
     const lmOptions = {
       damping: 1.5,
       gradientDifference: 1e-6,
-      maxIterations: 100,
+      maxIterations: 500,      // a stalled fit often needs a few hundred slow LM steps
       errorTolerance: Math.max(1e-12, zAvg * 1e-5),
       bounds: null
     };
